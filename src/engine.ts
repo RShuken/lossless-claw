@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, createReadStream, openSync, readSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { createInterface } from "node:readline";
 import type {
   ContextEngine,
   ContextEngineInfo,
@@ -30,6 +31,7 @@ import {
 import {
   extensionFromNameOrMime,
   formatFileReference,
+  formatToolOutputReference,
   generateExplorationSummary,
   parseFileBlocks,
 } from "./large-files.js";
@@ -168,6 +170,15 @@ function extractStructuredText(value: unknown, depth: number = 0): string | unde
 
   // Skip tool call/result objects — their structured data belongs in the parts table, not content
   if (typeof record.type === "string" && TOOL_RAW_TYPES.has(record.type)) {
+    if (safeBoolean(record.toolOutputExternalized)) {
+      const externalizedText =
+        extractStructuredText(record.output, depth + 1) ??
+        extractStructuredText(record.content, depth + 1) ??
+        extractStructuredText(record.result, depth + 1);
+      if (typeof externalizedText === "string" && externalizedText.trim().length > 0) {
+        return externalizedText;
+      }
+    }
     return undefined;
   }
 
@@ -564,6 +575,13 @@ function buildMessageParts(params: {
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
+        externalizedFileId: safeString(metadataRecord?.externalizedFileId),
+        originalByteSize:
+          typeof metadataRecord?.originalByteSize === "number"
+            ? metadataRecord.originalByteSize
+            : undefined,
+        toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
+        externalizationReason: safeString(metadataRecord?.externalizationReason),
         rawType: block.type,
         raw: metadataRecord ?? message.content[ordinal],
       }),
@@ -639,6 +657,15 @@ function toStoredMessage(message: AgentMessage): StoredMessage {
   };
 }
 
+function createBootstrapEntryHash(message: StoredMessage | null): string | null {
+  if (!message) {
+    return null;
+  }
+  return createHash("sha256")
+    .update(JSON.stringify({ role: message.role, content: message.content }))
+    .digest("hex");
+}
+
 function estimateMessageContentTokensForAfterTurn(content: unknown): number {
   if (typeof content === "string") {
     return estimateTokens(content);
@@ -702,53 +729,216 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
   return "content" in msg || ("command" in msg && "output" in msg);
 }
 
-/** Load recoverable messages from a JSON/JSONL session file. */
-function readLeafPathMessages(sessionFile: string): AgentMessage[] {
-  let raw = "";
-  try {
-    raw = readFileSync(sessionFile, "utf8");
-  } catch {
-    return [];
-  }
+function extractBootstrapMessageCandidate(value: unknown): AgentMessage | null {
+  const candidate =
+    value && typeof value === "object" && "message" in value
+      ? (value as { message?: unknown }).message
+      : value;
+  return isBootstrapMessage(candidate) ? candidate : null;
+}
 
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return [];
-  }
-
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed.filter(isBootstrapMessage);
-    } catch {
-      return [];
-    }
-  }
-
+function parseBootstrapJsonl(raw: string, options?: {
+  strict?: boolean;
+}): { messages: AgentMessage[]; sawNonWhitespace: boolean; hadMalformedLine: boolean } {
   const messages: AgentMessage[] = [];
   const lines = raw.split(/\r?\n/);
+  let sawNonWhitespace = false;
+  let hadMalformedLine = false;
   for (const line of lines) {
     const item = line.trim();
     if (!item) {
       continue;
     }
+    sawNonWhitespace = true;
     try {
       const parsed = JSON.parse(item);
-      const candidate =
-        parsed && typeof parsed === "object" && "message" in parsed
-          ? (parsed as { message?: unknown }).message
-          : parsed;
-      if (isBootstrapMessage(candidate)) {
+      const candidate = extractBootstrapMessageCandidate(parsed);
+      if (candidate) {
         messages.push(candidate);
+        continue;
+      }
+      if (options?.strict) {
+        hadMalformedLine = true;
       }
     } catch {
-      // Skip malformed lines.
+      if (options?.strict) {
+        hadMalformedLine = true;
+      }
     }
   }
-  return messages;
+  return { messages, sawNonWhitespace, hadMalformedLine };
+}
+
+/** Load recoverable messages from a JSON/JSONL session file without full-file reads for JSONL. */
+async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]> {
+  try {
+    let sawNonWhitespace = false;
+    let jsonArrayMode = false;
+    let jsonArrayBuffer = "";
+    const messages: AgentMessage[] = [];
+    const stream = createReadStream(sessionFile, { encoding: "utf8" });
+    const lines = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of lines) {
+      if (!sawNonWhitespace) {
+        const trimmed = line.trim();
+        if (trimmed) {
+          sawNonWhitespace = true;
+          if (trimmed.startsWith("[")) {
+            jsonArrayMode = true;
+          }
+        }
+      }
+
+      if (jsonArrayMode) {
+        jsonArrayBuffer += `${line}\n`;
+        continue;
+      }
+
+      const parsed = parseBootstrapJsonl(line);
+      if (parsed.messages.length > 0) {
+        messages.push(...parsed.messages);
+      }
+    }
+
+    if (jsonArrayMode) {
+      const trimmed = jsonArrayBuffer.trim();
+      if (!trimmed) {
+        return [];
+      }
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (!Array.isArray(parsed)) {
+          return [];
+        }
+        return parsed.filter(isBootstrapMessage);
+      } catch {
+        return [];
+      }
+    }
+
+    return messages;
+  } catch {
+    return [];
+  }
+}
+
+function readFileSegment(sessionFile: string, offset: number): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(sessionFile, "r");
+    const stats = statSync(sessionFile);
+    const safeOffset = Math.max(0, Math.min(Math.floor(offset), stats.size));
+    const length = stats.size - safeOffset;
+    if (length <= 0) {
+      return "";
+    }
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, safeOffset);
+    return buffer.toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) {
+      closeSync(fd);
+    }
+  }
+}
+
+function readLastJsonlEntryBeforeOffset(sessionFile: string, offset: number): string | null {
+  const chunkSize = 16_384;
+  let fd: number | null = null;
+  try {
+    const safeOffset = Math.max(0, Math.floor(offset));
+    if (safeOffset <= 0) {
+      return null;
+    }
+
+    fd = openSync(sessionFile, "r");
+    let cursor = safeOffset;
+    let carry = "";
+    while (cursor > 0) {
+      const start = Math.max(0, cursor - chunkSize);
+      const length = cursor - start;
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, start);
+      carry = buffer.toString("utf8") + carry;
+
+      const trimmedEnd = carry.replace(/\s+$/u, "");
+      if (!trimmedEnd) {
+        cursor = start;
+        carry = "";
+        continue;
+      }
+
+      const newlineIndex = Math.max(trimmedEnd.lastIndexOf("\n"), trimmedEnd.lastIndexOf("\r"));
+      if (newlineIndex >= 0) {
+        const candidate = trimmedEnd.slice(newlineIndex + 1).trim();
+        if (candidate) {
+          return candidate;
+        }
+        carry = trimmedEnd.slice(0, newlineIndex);
+        cursor = start;
+        continue;
+      }
+
+      if (start === 0) {
+        return trimmedEnd.trim() || null;
+      }
+      cursor = start;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd != null) {
+      closeSync(fd);
+    }
+  }
+}
+
+function readAppendedLeafPathMessages(params: {
+  sessionFile: string;
+  offset: number;
+}): { messages: AgentMessage[]; canUseAppendOnly: boolean; sawNonWhitespace: boolean } {
+  const raw = readFileSegment(params.sessionFile, params.offset);
+  if (raw == null) {
+    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: false };
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { messages: [], canUseAppendOnly: true, sawNonWhitespace: false };
+  }
+
+  if (trimmed.startsWith("[")) {
+    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: true };
+  }
+
+  const parsed = parseBootstrapJsonl(raw, { strict: true });
+  if (parsed.hadMalformedLine) {
+    return { messages: [], canUseAppendOnly: false, sawNonWhitespace: parsed.sawNonWhitespace };
+  }
+
+  return {
+    messages: parsed.messages,
+    canUseAppendOnly: true,
+    sawNonWhitespace: parsed.sawNonWhitespace,
+  };
+}
+
+function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
+  if (!line) {
+    return null;
+  }
+  try {
+    return extractBootstrapMessageCandidate(JSON.parse(line));
+  } catch {
+    return null;
+  }
 }
 
 function messageIdentity(role: string, content: string): string {
@@ -1104,6 +1294,53 @@ export class LcmContextEngine implements ContextEngine {
     return filePath;
   }
 
+  /** Persist a large text payload and return the resulting compact placeholder. */
+  private async externalizeLargeTextPayload(params: {
+    conversationId: number;
+    content: string;
+    fileName?: string;
+    mimeType?: string;
+    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
+  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
+    const summarizeText = await this.resolveLargeFileTextSummarizer();
+    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
+    const storageUri = await this.storeLargeFileContent({
+      conversationId: params.conversationId,
+      fileId,
+      extension,
+      content: params.content,
+    });
+    const byteSize = Buffer.byteLength(params.content, "utf8");
+    const explorationSummary = await generateExplorationSummary({
+      content: params.content,
+      fileName: params.fileName,
+      mimeType: params.mimeType,
+      summarizeText,
+    });
+
+    await this.summaryStore.insertLargeFile({
+      fileId,
+      conversationId: params.conversationId,
+      fileName: params.fileName,
+      mimeType: params.mimeType,
+      byteSize,
+      storageUri,
+      explorationSummary,
+    });
+
+    return {
+      fileId,
+      byteSize,
+      summary: explorationSummary,
+      reference: params.formatReference({
+        fileId,
+        byteSize,
+        summary: explorationSummary,
+      }),
+    };
+  }
+
   /**
    * Intercept oversized <file> blocks before persistence and replace them with
    * compact file references backed by large_files records.
@@ -1118,7 +1355,6 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const summarizeText = await this.resolveLargeFileTextSummarizer();
     const fileIds: string[] = [];
     const rewrittenSegments: string[] = [];
     let cursor = 0;
@@ -1131,44 +1367,25 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       interceptedAny = true;
-      const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      const extension = extensionFromNameOrMime(block.fileName, block.mimeType);
-      const storageUri = await this.storeLargeFileContent({
+      const externalized = await this.externalizeLargeTextPayload({
         conversationId: params.conversationId,
-        fileId,
-        extension,
-        content: block.text,
-      });
-      const byteSize = Buffer.byteLength(block.text, "utf8");
-      const explorationSummary = await generateExplorationSummary({
         content: block.text,
         fileName: block.fileName,
         mimeType: block.mimeType,
-        summarizeText,
-      });
-
-      await this.summaryStore.insertLargeFile({
-        fileId,
-        conversationId: params.conversationId,
-        fileName: block.fileName,
-        mimeType: block.mimeType,
-        byteSize,
-        storageUri,
-        explorationSummary,
+        formatReference: ({ fileId, byteSize, summary }) =>
+          formatFileReference({
+            fileId,
+            fileName: block.fileName,
+            mimeType: block.mimeType,
+            byteSize,
+            summary,
+          }),
       });
 
       rewrittenSegments.push(params.content.slice(cursor, block.start));
-      rewrittenSegments.push(
-        formatFileReference({
-          fileId,
-          fileName: block.fileName,
-          mimeType: block.mimeType,
-          byteSize,
-          summary: explorationSummary,
-        }),
-      );
+      rewrittenSegments.push(externalized.reference);
       cursor = block.end;
-      fileIds.push(fileId);
+      fileIds.push(externalized.fileId);
     }
 
     if (!interceptedAny) {
@@ -1178,6 +1395,146 @@ export class LcmContextEngine implements ContextEngine {
     rewrittenSegments.push(params.content.slice(cursor));
     return {
       rewrittenContent: rewrittenSegments.join(""),
+      fileIds,
+    };
+  }
+
+  /** Externalize oversized textual tool outputs before they are persisted inline. */
+  private async interceptLargeToolResults(params: {
+    conversationId: number;
+    message: AgentMessage;
+  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
+    if (
+      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
+      !("content" in params.message)
+    ) {
+      return null;
+    }
+    if (!Array.isArray(params.message.content)) {
+      return null;
+    }
+
+    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
+    const rewrittenContent: unknown[] = [];
+    const fileIds: string[] = [];
+    let interceptedAny = false;
+    const topLevel = params.message as Record<string, unknown>;
+    const topLevelToolCallId =
+      safeString(topLevel.toolCallId) ??
+      safeString(topLevel.tool_call_id) ??
+      safeString(topLevel.toolUseId) ??
+      safeString(topLevel.tool_use_id) ??
+      safeString(topLevel.call_id) ??
+      safeString(topLevel.id);
+    const topLevelToolName =
+      safeString(topLevel.toolName) ??
+      safeString(topLevel.tool_name);
+    const topLevelIsError =
+      safeBoolean(topLevel.isError) ??
+      safeBoolean(topLevel.is_error);
+
+    for (const item of params.message.content) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      const record = item as Record<string, unknown>;
+      const rawType = safeString(record.type);
+      const isStructuredToolResult =
+        rawType !== "tool_result" &&
+        rawType !== "toolResult" &&
+        rawType !== "function_call_output";
+      const isPlainTextToolResult =
+        rawType === "text" &&
+        typeof record.text === "string";
+      if (isStructuredToolResult && !isPlainTextToolResult) {
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      const textSource =
+        isPlainTextToolResult
+          ? record.text
+          : record.output !== undefined
+          ? record.output
+          : record.content !== undefined
+            ? record.content
+            : record;
+      const extractedText = extractStructuredText(textSource);
+      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
+        rewrittenContent.push(item);
+        continue;
+      }
+
+      interceptedAny = true;
+      const toolName =
+        safeString(record.name) ??
+        topLevelToolName ??
+        "tool-result";
+      const externalized = await this.externalizeLargeTextPayload({
+        conversationId: params.conversationId,
+        content: extractedText,
+        fileName: `${toolName}.txt`,
+        mimeType: "text/plain",
+        formatReference: ({ fileId, byteSize, summary }) =>
+          formatToolOutputReference({
+            fileId,
+            toolName,
+            byteSize,
+            summary,
+          }),
+      });
+
+      const normalizedRawType =
+        rawType === "function_call_output" ? "function_call_output" : "tool_result";
+      const compactBlock: Record<string, unknown> = {
+        type: normalizedRawType,
+        output: externalized.reference,
+        externalizedFileId: externalized.fileId,
+        originalByteSize: externalized.byteSize,
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      };
+      const callId =
+        safeString(record.tool_use_id) ??
+        safeString(record.toolUseId) ??
+        safeString(record.tool_call_id) ??
+        safeString(record.toolCallId) ??
+        safeString(record.call_id) ??
+        safeString(record.id) ??
+        topLevelToolCallId;
+      if (callId) {
+        if (normalizedRawType === "function_call_output") {
+          compactBlock.call_id = callId;
+        } else {
+          compactBlock.tool_use_id = callId;
+        }
+      }
+      if (typeof record.is_error === "boolean") {
+        compactBlock.is_error = record.is_error;
+      } else if (typeof record.isError === "boolean") {
+        compactBlock.isError = record.isError;
+      } else if (typeof topLevelIsError === "boolean") {
+        compactBlock.isError = topLevelIsError;
+      }
+      if (toolName) {
+        compactBlock.name = toolName;
+      }
+
+      rewrittenContent.push(compactBlock);
+      fileIds.push(externalized.fileId);
+    }
+
+    if (!interceptedAny) {
+      return null;
+    }
+
+    return {
+      rewrittenMessage: {
+        ...params.message,
+        content: rewrittenContent,
+      } as AgentMessage,
       fileIds,
     };
   }
@@ -1315,93 +1672,221 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     this.ensureMigrated();
+    const sessionFileStats = statSync(params.sessionFile);
+    const sessionFileSize = sessionFileStats.size;
+    const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
 
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
+          const persistBootstrapState = async (
+            conversationId: number,
+            historicalMessages: AgentMessage[],
+          ): Promise<void> => {
+            const lastMessage =
+              historicalMessages.length > 0
+                ? toStoredMessage(historicalMessages[historicalMessages.length - 1]!)
+                : null;
+            await this.summaryStore.upsertConversationBootstrapState({
+              conversationId,
+              sessionFilePath: params.sessionFile,
+              lastSeenSize: sessionFileSize,
+              lastSeenMtimeMs: sessionFileMtimeMs,
+              lastProcessedOffset: sessionFileSize,
+              lastProcessedEntryHash: createBootstrapEntryHash(lastMessage),
+            });
+          };
+
           const conversation = await this.conversationStore.getOrCreateConversation(params.sessionId, {
             sessionKey: params.sessionKey,
           });
           const conversationId = conversation.conversationId;
-          const historicalMessages = readLeafPathMessages(params.sessionFile);
+          const existingCount = await this.conversationStore.getMessageCount(conversationId);
+          const bootstrapState =
+            existingCount > 0
+              ? await this.summaryStore.getConversationBootstrapState(conversationId)
+              : null;
 
-        // First-time import path: no LCM rows yet, so seed directly from the
-        // active leaf context snapshot.
-        const existingCount = await this.conversationStore.getMessageCount(conversationId);
-        if (existingCount === 0) {
-          if (historicalMessages.length === 0) {
-            await this.conversationStore.markConversationBootstrapped(conversationId);
+          // If the transcript file is byte-for-byte unchanged from the last
+          // successful bootstrap checkpoint, skip reopening and reparsing it.
+          if (
+            bootstrapState &&
+            bootstrapState.sessionFilePath === params.sessionFile &&
+            bootstrapState.lastSeenSize === sessionFileSize &&
+            bootstrapState.lastSeenMtimeMs === sessionFileMtimeMs
+          ) {
+            if (!conversation.bootstrappedAt) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
             return {
               bootstrapped: false,
               importedMessages: 0,
-              reason: "no leaf-path messages in session",
+              reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
             };
           }
 
-          const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
-          const bulkInput = historicalMessages.map((message, index) => {
-            const stored = toStoredMessage(message);
-            return {
-              conversationId,
-              seq: nextSeq + index,
-              role: stored.role,
-              content: stored.content,
-              tokenCount: stored.tokenCount,
-            };
-          });
+          if (
+            existingCount > 0 &&
+            bootstrapState &&
+            bootstrapState.sessionFilePath === params.sessionFile &&
+            sessionFileSize > bootstrapState.lastSeenSize &&
+            sessionFileMtimeMs >= bootstrapState.lastSeenMtimeMs
+          ) {
+            const latestDbMessage = await this.conversationStore.getLastMessage(conversationId);
+            const latestDbHash = latestDbMessage
+              ? createBootstrapEntryHash({
+                  role: latestDbMessage.role,
+                  content: latestDbMessage.content,
+                  tokenCount: latestDbMessage.tokenCount,
+                })
+              : null;
+            const tailEntryRaw = readLastJsonlEntryBeforeOffset(
+              params.sessionFile,
+              bootstrapState.lastProcessedOffset,
+            );
+            const tailEntryMessage = readBootstrapMessageFromJsonLine(tailEntryRaw);
+            const tailEntryHash = tailEntryMessage
+              ? createBootstrapEntryHash(toStoredMessage(tailEntryMessage))
+              : null;
 
-          const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
-          await this.summaryStore.appendContextMessages(
-            conversationId,
-            inserted.map((record) => record.messageId),
-          );
-          await this.conversationStore.markConversationBootstrapped(conversationId);
+            if (
+              latestDbHash &&
+              latestDbHash === bootstrapState.lastProcessedEntryHash &&
+              tailEntryHash &&
+              tailEntryHash === bootstrapState.lastProcessedEntryHash
+            ) {
+              const appended = readAppendedLeafPathMessages({
+                sessionFile: params.sessionFile,
+                offset: bootstrapState.lastProcessedOffset,
+              });
+              if (appended.canUseAppendOnly) {
+                if (!conversation.bootstrappedAt) {
+                  await this.conversationStore.markConversationBootstrapped(conversationId);
+                }
 
-          // Prune HEARTBEAT_OK turns from the freshly imported data
-          if (this.config.pruneHeartbeatOk) {
-            const pruned = await this.pruneHeartbeatOkTurns(conversationId);
-            if (pruned > 0) {
-              console.error(
-                `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
-              );
+                let importedMessages = 0;
+                for (const message of appended.messages) {
+                  const ingestResult = await this.ingestSingle({
+                    sessionId: params.sessionId,
+                    sessionKey: params.sessionKey,
+                    message,
+                  });
+                  if (ingestResult.ingested) {
+                    importedMessages += 1;
+                  }
+                }
+
+                const lastAppendedMessage =
+                  appended.messages.length > 0
+                    ? appended.messages[appended.messages.length - 1]!
+                    : tailEntryMessage;
+                await persistBootstrapState(
+                  conversationId,
+                  lastAppendedMessage ? [lastAppendedMessage] : [],
+                );
+
+                if (importedMessages > 0) {
+                  return {
+                    bootstrapped: true,
+                    importedMessages,
+                    reason: "reconciled missing session messages",
+                  };
+                }
+
+                return {
+                  bootstrapped: false,
+                  importedMessages: 0,
+                  reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
+                };
+              }
             }
           }
 
-          return {
-            bootstrapped: true,
-            importedMessages: inserted.length,
-          };
-        }
+          const historicalMessages = await readLeafPathMessages(params.sessionFile);
 
-        // Existing conversation path: reconcile crash gaps by appending JSONL
-        // messages that were never persisted to LCM.
-        const reconcile = await this.reconcileSessionTail({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          conversationId,
-          historicalMessages,
-        });
+          // First-time import path: no LCM rows yet, so seed directly from the
+          // active leaf context snapshot.
+          if (existingCount === 0) {
+            if (historicalMessages.length === 0) {
+              await this.conversationStore.markConversationBootstrapped(conversationId);
+              await persistBootstrapState(conversationId, historicalMessages);
+              return {
+                bootstrapped: false,
+                importedMessages: 0,
+                reason: "no leaf-path messages in session",
+              };
+            }
 
-        if (!conversation.bootstrappedAt) {
-          await this.conversationStore.markConversationBootstrapped(conversationId);
-        }
+            const nextSeq = (await this.conversationStore.getMaxSeq(conversationId)) + 1;
+            const bulkInput = historicalMessages.map((message, index) => {
+              const stored = toStoredMessage(message);
+              return {
+                conversationId,
+                seq: nextSeq + index,
+                role: stored.role,
+                content: stored.content,
+                tokenCount: stored.tokenCount,
+              };
+            });
 
-        if (reconcile.importedMessages > 0) {
-          return {
-            bootstrapped: true,
-            importedMessages: reconcile.importedMessages,
-            reason: "reconciled missing session messages",
-          };
-        }
+            const inserted = await this.conversationStore.createMessagesBulk(bulkInput);
+            await this.summaryStore.appendContextMessages(
+              conversationId,
+              inserted.map((record) => record.messageId),
+            );
+            await this.conversationStore.markConversationBootstrapped(conversationId);
+            await persistBootstrapState(conversationId, historicalMessages);
 
-        if (conversation.bootstrappedAt) {
-          return {
-            bootstrapped: false,
-            importedMessages: 0,
-            reason: "already bootstrapped",
-          };
-        }
+            // Prune HEARTBEAT_OK turns from the freshly imported data
+            if (this.config.pruneHeartbeatOk) {
+              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+              if (pruned > 0) {
+                console.error(
+                  `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
+                );
+              }
+            }
+
+            return {
+              bootstrapped: true,
+              importedMessages: inserted.length,
+            };
+          }
+
+          // Existing conversation path: reconcile crash gaps by appending JSONL
+          // messages that were never persisted to LCM.
+          const reconcile = await this.reconcileSessionTail({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            conversationId,
+            historicalMessages,
+          });
+
+          if (!conversation.bootstrappedAt) {
+            await this.conversationStore.markConversationBootstrapped(conversationId);
+          }
+
+          if (reconcile.importedMessages > 0) {
+            await persistBootstrapState(conversationId, historicalMessages);
+            return {
+              bootstrapped: true,
+              importedMessages: reconcile.importedMessages,
+              reason: "reconciled missing session messages",
+            };
+          }
+
+          if (reconcile.hasOverlap) {
+            await persistBootstrapState(conversationId, historicalMessages);
+          }
+
+          if (conversation.bootstrappedAt) {
+            return {
+              bootstrapped: false,
+              importedMessages: 0,
+              reason: "already bootstrapped",
+            };
+          }
 
           return {
             bootstrapped: false,
@@ -1473,6 +1958,17 @@ export class LcmContextEngine implements ContextEngine {
             content: stored.content,
           } as AgentMessage;
         }
+      }
+    } else if (stored.role === "tool") {
+      const intercepted = await this.interceptLargeToolResults({
+        conversationId,
+        message,
+      });
+      if (intercepted) {
+        messageForParts = intercepted.rewrittenMessage;
+        const rewrittenStored = toStoredMessage(intercepted.rewrittenMessage);
+        stored.content = rewrittenStored.content;
+        stored.tokenCount = rewrittenStored.tokenCount;
       }
     }
 

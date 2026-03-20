@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -15,6 +15,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
   resolveDelegatedExpansionGrantId,
 } from "../src/expansion-auth.js";
+import { RetrievalEngine } from "../src/retrieval.js";
 import type { LcmDependencies } from "../src/types.js";
 
 const tempDirs: string[] = [];
@@ -186,6 +187,13 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
     content: params.content,
     timestamp: Date.now(),
   } as AgentMessage;
+}
+
+function corruptSessionFilePreservingObservedStats(sessionFile: string): void {
+  const originalStats = statSync(sessionFile);
+  writeFileSync(sessionFile, "x".repeat(originalStats.size));
+  const restoredMtime = new Date(originalStats.mtimeMs);
+  utimesSync(sessionFile, restoredMtime, restoredMtime);
 }
 
 function estimateAssembledPayloadTokens(messages: AgentMessage[]): number {
@@ -948,6 +956,210 @@ describe("LcmContextEngine.ingest content extraction", () => {
     });
   });
 
+  it("externalizes oversized tool-result payloads into large_files", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const toolOutput = `${"tool output line\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_externalized",
+              name: "exec",
+              input: { cmd: "pwd" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_externalized",
+          toolName: "exec",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_externalized",
+              name: "exec",
+              content: [{ type: "text", text: toolOutput }],
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Output: file_");
+      expect(storedMessages[1].content).toContain("tool=exec");
+      expect(storedMessages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(storedFile!.mimeType).toBe("text/plain");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].partType).toBe("tool");
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      expect(assembled.messages).toHaveLength(2);
+      const assembledToolResult = assembled.messages[1] as {
+        role: string;
+        content?: Array<{ output?: unknown }>;
+      };
+      expect(assembledToolResult.role).toBe("toolResult");
+      expect(typeof assembledToolResult.content?.[0]?.output).toBe("string");
+      expect(String(assembledToolResult.content?.[0]?.output)).toContain(fileId);
+
+      const retrieval = new RetrievalEngine(
+        engine.getConversationStore(),
+        engine.getSummaryStore(),
+      );
+      const described = await retrieval.describe(fileId);
+      expect(described?.type).toBe("file");
+      expect(described?.file?.storageUri).toBe(storedFile!.storageUri);
+
+      const searchable = await engine.getConversationStore().searchMessages({
+        conversationId: conversation!.conversationId,
+        query: "exec",
+        mode: "full_text",
+      });
+      expect(searchable).toHaveLength(1);
+
+      const noisy = await engine.getConversationStore().searchMessages({
+        conversationId: conversation!.conversationId,
+        query: "lcm_describe",
+        mode: "full_text",
+      });
+      expect(noisy).toHaveLength(0);
+    });
+  });
+
+  it("externalizes oversized plain-text tool-result blocks from live exec-style messages", async () => {
+    await withTempHome(async () => {
+      const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+      const sessionId = randomUUID();
+      const toolOutput = `${"minified js chunk\n".repeat(160)}done`;
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_live_exec",
+              name: "exec",
+              input: { cmd: "head -c 200000 viewer-runtime.js" },
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      await engine.ingest({
+        sessionId,
+        message: {
+          role: "toolResult",
+          toolCallId: "call_live_exec",
+          toolName: "exec",
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: toolOutput,
+            },
+          ],
+        } as AgentMessage,
+      });
+
+      const conversation = await engine
+        .getConversationStore()
+        .getConversationBySessionId(sessionId);
+      expect(conversation).not.toBeNull();
+
+      const storedMessages = await engine
+        .getConversationStore()
+        .getMessages(conversation!.conversationId);
+      expect(storedMessages).toHaveLength(2);
+      expect(storedMessages[1].content).toContain("[LCM Tool Output: file_");
+      expect(storedMessages[1].content).toContain("tool=exec");
+      expect(storedMessages[1].content).not.toContain(toolOutput.slice(0, 64));
+
+      const fileIdMatch = storedMessages[1].content.match(/file_[a-f0-9]{16}/);
+      expect(fileIdMatch).not.toBeNull();
+      const fileId = fileIdMatch![0];
+
+      const storedFile = await engine.getSummaryStore().getLargeFile(fileId);
+      expect(storedFile).not.toBeNull();
+      expect(storedFile!.fileName).toBe("exec.txt");
+      expect(readFileSync(storedFile!.storageUri, "utf8")).toBe(toolOutput);
+
+      const parts = await engine.getConversationStore().getMessageParts(storedMessages[1].messageId);
+      expect(parts).toHaveLength(1);
+      expect(parts[0].partType).toBe("tool");
+      expect(parts[0].toolCallId).toBe("call_live_exec");
+      expect(parts[0].toolName).toBe("exec");
+      const metadata = JSON.parse(parts[0].metadata ?? "{}") as Record<string, unknown>;
+      expect(metadata).toMatchObject({
+        originalRole: "toolResult",
+        rawType: "tool_result",
+        externalizedFileId: fileId,
+        originalByteSize: Buffer.byteLength(toolOutput, "utf8"),
+        toolOutputExternalized: true,
+        externalizationReason: "large_tool_result",
+      });
+
+      const assembler = new ContextAssembler(engine.getConversationStore(), engine.getSummaryStore());
+      const assembled = await assembler.assemble({
+        conversationId: conversation!.conversationId,
+        tokenBudget: 10_000,
+      });
+      expect(assembled.messages).toHaveLength(2);
+      const assembledToolResult = assembled.messages[1] as {
+        role: string;
+        toolCallId?: string;
+        toolName?: string;
+        content?: Array<{ output?: unknown }>;
+      };
+      expect(assembledToolResult.role).toBe("toolResult");
+      expect(assembledToolResult.toolCallId).toBe("call_live_exec");
+      expect(assembledToolResult.toolName).toBe("exec");
+      expect(typeof assembledToolResult.content?.[0]?.output).toBe("string");
+      expect(String(assembledToolResult.content?.[0]?.output)).toContain(fileId);
+    });
+  });
+
   it("serializes recycled session writes by stable sessionKey", async () => {
     const engine = createEngine();
     const sessionKey = "agent:main:main";
@@ -1094,6 +1306,17 @@ describe("LcmContextEngine.bootstrap", () => {
       .getContextItems(conversation!.conversationId);
     expect(contextItems).toHaveLength(4);
     expect(contextItems.every((item) => item.itemType === "message")).toBe(true);
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    const sessionFileStats = statSync(sessionFile);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.sessionFilePath).toBe(sessionFile);
+    expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("is idempotent and does not duplicate already bootstrapped sessions", async () => {
@@ -1127,6 +1350,78 @@ describe("LcmContextEngine.bootstrap", () => {
     );
   });
 
+  it("skips reopening the transcript when checkpoint stats match", async () => {
+    const sessionFile = createSessionFilePath("unchanged-fast-path");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-unchanged-fast-path";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    corruptSessionFilePreservingObservedStats(sessionFile);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second.bootstrapped).toBe(false);
+    expect(second.importedMessages).toBe(0);
+    expect(second.reason).toBe("already bootstrapped");
+  });
+
+  it("preserves ordinary bootstrap behavior when no checkpoint exists", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("missing-checkpoint");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "first" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "second" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-missing-checkpoint";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(`DELETE FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+      rawDb
+        .prepare(`UPDATE conversations SET bootstrapped_at = NULL WHERE conversation_id = ?`)
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    corruptSessionFilePreservingObservedStats(sessionFile);
+
+    await expect(engine.bootstrap({ sessionId, sessionFile })).resolves.toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "conversation already has messages",
+    });
+  });
+
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-tail");
     const sm = SessionManager.open(sessionFile);
@@ -1146,6 +1441,13 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(first.bootstrapped).toBe(true);
     expect(first.importedMessages).toBe(2);
 
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const firstBootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(firstBootstrapState).not.toBeNull();
+
     sm.appendMessage({
       role: "user",
       content: [{ type: "text", text: "lost user turn" }],
@@ -1160,8 +1462,6 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(second.importedMessages).toBe(2);
     expect(second.reason).toBe("reconciled missing session messages");
 
-    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((message) => message.content)).toEqual([
       "seed user",
@@ -1169,6 +1469,114 @@ describe("LcmContextEngine.bootstrap", () => {
       "lost user turn",
       "lost assistant turn",
     ]);
+
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    const sessionFileStats = statSync(sessionFile);
+    expect(bootstrapState).not.toBeNull();
+    expect(bootstrapState?.lastSeenSize).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastSeenMtimeMs).toBe(Math.trunc(sessionFileStats.mtimeMs));
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
+    expect(bootstrapState?.lastProcessedEntryHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(bootstrapState?.lastSeenSize).toBeGreaterThan(firstBootstrapState!.lastSeenSize);
+    expect(bootstrapState?.lastProcessedEntryHash).not.toBe(firstBootstrapState!.lastProcessedEntryHash);
+  });
+
+  it("imports appended tail messages without replaying full reconciliation", async () => {
+    const sessionFile = createSessionFilePath("append-only-tail");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-append-only-tail";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+    expect(first.importedMessages).toBe(2);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("append-only-mismatch");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-append-only-mismatch";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_entry_hash = ?
+           WHERE conversation_id = ?`,
+        )
+        .run("mismatch", conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "tail assistant" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).toHaveBeenCalledTimes(1);
   });
 
   it("reconciles missing structured tool-call tail when prior empty tool content exists", async () => {
@@ -1282,6 +1690,40 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(result.bootstrapped).toBe(true);
     expect(bulkSpy).toHaveBeenCalledTimes(1);
     expect(singleSpy).not.toHaveBeenCalled();
+  });
+
+  it("streams JSONL replay and skips malformed lines while keeping later messages", async () => {
+    const sessionFile = createSessionFilePath("streaming-jsonl");
+    const lines: string[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      const role = index % 2 === 0 ? "user" : "assistant";
+      lines.push(
+        JSON.stringify({
+          message: {
+            role,
+            content: [{ type: "text", text: `${role}-${index}` }],
+          },
+        }),
+      );
+      if (index === 17) {
+        lines.push("{ malformed json line");
+      }
+    }
+    writeFileSync(sessionFile, `${lines.join("\n")}\n`, "utf8");
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-streaming-jsonl";
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(40);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(40);
+    expect(stored[0]?.content).toBe("user-0");
+    expect(stored[39]?.content).toBe("assistant-39");
   });
 
   it("prepareSubagentSpawn resolves parent conversation by sessionKey before UUID backfill", async () => {
